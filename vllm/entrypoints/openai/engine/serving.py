@@ -929,6 +929,7 @@ class OpenAIServing:
         request: RendererRequest,
         prompt_input: str | list[str] | list[int] | list[list[int]] | None,
         prompt_embeds: bytes | list[bytes] | None,
+        extra_prompt_extras: dict[str, Any] | None = None,
     ) -> list[ProcessorInputs]:
         prompts = list[SingletonPrompt | bytes]()
         if prompt_embeds is not None:  # embeds take higher priority
@@ -936,12 +937,15 @@ class OpenAIServing:
         if prompt_input is not None:
             prompts.extend(prompt_to_seq(prompt_input))
 
-        return await self._preprocess_cmpl(request, prompts)
+        return await self._preprocess_cmpl(
+            request, prompts, extra_prompt_extras=extra_prompt_extras
+        )
 
     async def _preprocess_cmpl(
         self,
         request: RendererRequest,
         prompts: Sequence[PromptType | bytes],
+        extra_prompt_extras: dict[str, Any] | None = None,
     ) -> list[ProcessorInputs]:
         renderer = self.renderer
         model_config = self.model_config
@@ -956,14 +960,18 @@ class OpenAIServing:
         ]
         tok_params = request.build_tok_params(model_config)
 
+        prompt_extras = {
+            k: v
+            for k in ("mm_processor_kwargs", "cache_salt")
+            if (v := getattr(request, k, None)) is not None
+        }
+        if extra_prompt_extras:
+            prompt_extras.update(extra_prompt_extras)
+
         return await renderer.render_cmpl_async(
             parsed_prompts,
             tok_params,
-            prompt_extras={
-                k: v
-                for k in ("mm_processor_kwargs", "cache_salt")
-                if (v := getattr(request, k, None)) is not None
-            },
+            prompt_extras=prompt_extras,
         )
 
     async def _preprocess_chat(

@@ -147,6 +147,21 @@ class CompletionRequest(OpenAIBaseModel):
         ),
     )
 
+    multi_modal_data: dict[str, str | list[str]] | None = Field(
+        default=None,
+        description=(
+            "Multi-modal data as URLs (http/https, data:, or file:) "
+            "keyed by modality (e.g. 'image', 'audio', 'video'). "
+            "Values can be a single URL or a list of URLs. "
+            'Example: {"image": ["data:image/png;base64,..."]}'
+        ),
+    )
+
+    mm_processor_kwargs: dict[str, Any] | None = Field(
+        default=None,
+        description="Additional kwargs to pass to the HF processor.",
+    )
+
     kv_transfer_params: dict[str, Any] | None = Field(
         default=None,
         description="KVTransfer parameters used for disaggregated serving.",

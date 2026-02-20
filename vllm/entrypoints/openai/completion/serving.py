@@ -5,7 +5,7 @@ import asyncio
 import time
 from collections.abc import AsyncGenerator, AsyncIterator
 from collections.abc import Sequence as GenericSequence
-from typing import cast
+from typing import Any, cast
 
 import jinja2
 from fastapi import Request
@@ -110,11 +110,45 @@ class OpenAIServingCompletion(OpenAIServing):
                 "prompt_logprobs is not compatible with prompt embeds."
             )
 
+        if request.multi_modal_data is not None:
+            if not self.model_config.is_multimodal_model:
+                return self.create_error_response(
+                    "multi_modal_data is not supported for non-multimodal models."
+                )
+            # Batch prompts with multi_modal_data not supported yet
+            prompt = request.prompt
+            if (
+                isinstance(prompt, list)
+                and prompt
+                and isinstance(prompt[0], (list, str))
+            ):
+                if len(prompt) > 1:
+                    return self.create_error_response(
+                        "multi_modal_data with batch prompts is not "
+                        "supported. Send one prompt at a time when "
+                        "using multi_modal_data."
+                    )
+
+        resolved_mm_data: dict[str, Any] | None = None
+        if request.multi_modal_data:
+            try:
+                resolved_mm_data = await self._resolve_multi_modal_data(
+                    request.multi_modal_data
+                )
+            except Exception as e:
+                logger.exception("Error resolving multi-modal data")
+                return self.create_error_response(e)
+
         try:
             engine_prompts = await self._preprocess_completion(
                 request,
                 prompt_input=request.prompt,
                 prompt_embeds=request.prompt_embeds,
+                extra_prompt_extras=(
+                    {"multi_modal_data": resolved_mm_data}
+                    if resolved_mm_data is not None
+                    else None
+                ),
             )
         except (ValueError, TypeError, RuntimeError, jinja2.TemplateError) as e:
             logger.exception("Error in preprocessing prompt inputs")
@@ -679,3 +713,48 @@ class OpenAIServingCompletion(OpenAIServing):
             tokens=out_tokens,
             top_logprobs=out_top_logprobs,
         )
+
+    async def _resolve_multi_modal_data(
+        self,
+        multi_modal_data: dict[str, str | list[str]],
+    ) -> dict[str, Any]:
+        """Resolve multi-modal data URLs to actual media objects.
+
+        Uses MediaConnector to fetch images/audio/video from URLs
+        (http/https, data:, or file:).
+        """
+        import vllm.envs as envs
+        from vllm.multimodal.media import MEDIA_CONNECTOR_REGISTRY
+
+        multimodal_config = self.model_config.multimodal_config
+        media_io_kwargs = getattr(multimodal_config, "media_io_kwargs", None)
+        connector = MEDIA_CONNECTOR_REGISTRY.load(
+            envs.VLLM_MEDIA_CONNECTOR,
+            media_io_kwargs=media_io_kwargs,
+            allowed_local_media_path=(self.model_config.allowed_local_media_path),
+            allowed_media_domains=self.model_config.allowed_media_domains,
+        )
+
+        fetch_map = {
+            "image": connector.fetch_image_async,
+            "audio": connector.fetch_audio_async,
+            "video": connector.fetch_video_async,
+        }
+
+        resolved: dict[str, Any] = {}
+        for modality, urls in multi_modal_data.items():
+            fetch_fn = fetch_map.get(modality)
+            if fetch_fn is None:
+                raise ValueError(
+                    f"Unsupported modality: {modality!r}. "
+                    f"Supported modalities: {list(fetch_map.keys())}"
+                )
+
+            if isinstance(urls, str):
+                resolved[modality] = await fetch_fn(urls)
+            else:
+                resolved[modality] = await asyncio.gather(
+                    *(fetch_fn(url) for url in urls)
+                )
+
+        return resolved
