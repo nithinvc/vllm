@@ -247,6 +247,7 @@ class OpenAIServingRender:
                 default_template_kwargs=self.default_chat_template_kwargs,
                 tool_dicts=tool_dicts,
                 tool_parser=tool_parser,
+                skip_mm_cache=True,
             )
         else:
             # For GPT-OSS.
