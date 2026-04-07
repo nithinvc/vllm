@@ -34,11 +34,8 @@ from vllm.entrypoints.serve.disagg.protocol import (
     GenerateStreamResponse,
 )
 from vllm.entrypoints.serve.render.serving import OpenAIServingRender
-<<<<<<< nithinc/mm-generate-dco
-from vllm.inputs import EngineInput, mm_input
-=======
 from vllm.entrypoints.utils import should_include_usage
->>>>>>> main
+from vllm.inputs import EngineInput, mm_input
 from vllm.logger import init_logger
 from vllm.logprobs import Logprob
 from vllm.multimodal.inputs import (
