@@ -337,6 +337,7 @@ class OpenAIServingRender:
             request,
             prompt_input=request.prompt,
             prompt_embeds=request.prompt_embeds,
+            skip_mm_cache=True,
         )
 
         return engine_inputs
