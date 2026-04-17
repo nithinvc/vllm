@@ -3,7 +3,10 @@
 """Tests for multimodal features through the /inference/v1/generate endpoint.
 
 Mirrors test_serving_tokens.py but exercises the multimodal piping
-using Qwen/Qwen3-VL-2B-Instruct with pre-processed image features.
+using Qwen/Qwen3-VL-2B-Instruct end-to-end via the server's /render ->
+/generate -> /detokenize path. Intentionally avoids running the HF
+processor in the pytest parent process to keep os.fork() in sibling
+tests (e.g. test_weight_transfer_llm.py) deadlock-free.
 """
 
 import os
@@ -12,35 +15,14 @@ import httpx
 import pytest
 import pytest_asyncio
 from PIL import Image
-from transformers import AutoConfig, AutoProcessor
 
 from tests.utils import RemoteOpenAIServer
-from vllm.entrypoints.serve.disagg.mm_serde import encode_mm_kwargs_item
-from vllm.entrypoints.serve.disagg.protocol import (
-    MultiModalFeatures,
-    PlaceholderRangeInfo,
-)
-from vllm.multimodal.inputs import (
-    MultiModalBatchedField,
-    MultiModalFieldElem,
-    MultiModalFlatField,
-    MultiModalKwargsItem,
-)
 from vllm.multimodal.utils import encode_image_url
 
 MODEL_NAME = "Qwen/Qwen3-VL-2B-Instruct"
 GEN_ENDPOINT = "/inference/v1/generate"
 RENDER_ENDPOINT = "/v1/chat/completions/render"
-
-
-@pytest.fixture(scope="module")
-def processor():
-    return AutoProcessor.from_pretrained(MODEL_NAME)
-
-
-@pytest.fixture(scope="module")
-def model_config():
-    return AutoConfig.from_pretrained(MODEL_NAME)
+DETOKENIZE_ENDPOINT = "/detokenize"
 
 
 @pytest.fixture(scope="module")
@@ -79,107 +61,13 @@ async def client(server: RemoteOpenAIServer):
         yield c
 
 
-def build_mm_payload(
-    processor,
-    model_config,
-    image: Image.Image,
-    text: str,
-    sampling_params: dict,
-    model_name: str = MODEL_NAME,
-) -> dict:
-    """Simulate what a coordinator does: pre-process an image with the HF
-    processor and build a GenerateRequest payload with serialized features."""
-    messages = [
-        {
-            "role": "user",
-            "content": [
-                {"type": "image"},
-                {"type": "text", "text": text},
-            ],
-        }
-    ]
-    prompt = processor.apply_chat_template(
-        messages,
-        tokenize=False,
-        add_generation_prompt=True,
-    )
-    inputs = processor(text=[prompt], images=[image], return_tensors="pt")
-
-    token_ids = inputs["input_ids"][0].tolist()
-    pixel_values = inputs["pixel_values"]
-    image_grid_thw = inputs["image_grid_thw"]
-
-    image_token_id = model_config.image_token_id
-    first_idx = token_ids.index(image_token_id)
-    length = 0
-    for i in range(first_idx, len(token_ids)):
-        if token_ids[i] == image_token_id:
-            length += 1
-        else:
-            break
-
-    num_pixels = int(image_grid_thw[0].prod().item())
-    mm_item = MultiModalKwargsItem(
-        {
-            "pixel_values": MultiModalFieldElem(
-                data=pixel_values,
-                field=MultiModalFlatField(slices=[slice(0, num_pixels)], dim=0),
-            ),
-            "image_grid_thw": MultiModalFieldElem(
-                data=image_grid_thw[0],
-                field=MultiModalBatchedField(keep_on_cpu=True),
-            ),
-        }
-    )
-
-    encoded = encode_mm_kwargs_item(mm_item)
-    mm_hash = f"test_mm_hash_{id(image)}"
-
-    features = MultiModalFeatures(
-        mm_hashes={"image": [mm_hash]},
-        mm_placeholders={
-            "image": [PlaceholderRangeInfo(offset=first_idx, length=length)]
-        },
-        kwargs_data={"image": [encoded]},
-    )
-
-    return {
-        "model": model_name,
-        "token_ids": token_ids,
-        "features": features.model_dump(),
-        "sampling_params": sampling_params,
-        "stream": False,
-    }
-
-
 @pytest.mark.asyncio
-async def test_generate_endpoint(client, processor, model_config, test_image):
-    payload = build_mm_payload(
-        processor,
-        model_config,
-        test_image,
-        "What color is this image? Answer in one word.",
-        {"max_tokens": 10, "temperature": 0.0},
-    )
-    resp = await client.post(GEN_ENDPOINT, json=payload)
-    resp.raise_for_status()
-    data = resp.json()
-    assert "choices" in data
-    assert len(data["choices"]) >= 1
-    assert data["choices"][0]["token_ids"] is not None
-    assert len(data["choices"][0]["token_ids"]) > 0
+async def test_render_to_generate_roundtrip(client, test_image):
+    """End-to-end: render a multimodal chat -> feed into generate -> decode.
 
-    text = processor.tokenizer.decode(
-        data["choices"][0]["token_ids"], skip_special_tokens=True
-    )
-    assert "red" in text.lower(), (
-        f"Expected model to identify the red image, got: {text!r}"
-    )
-
-
-@pytest.mark.asyncio
-async def test_render_to_generate_roundtrip(client, processor, test_image):
-    """End-to-end: render a multimodal chat → feed into generate → decode."""
+    All preprocessing and detokenization happens in the server subprocess;
+    the pytest parent never imports transformers or touches torch tensors.
+    """
     data_url = encode_image_url(test_image, format="PNG")
 
     render_payload = {
@@ -202,11 +90,38 @@ async def test_render_to_generate_roundtrip(client, processor, test_image):
     render_resp.raise_for_status()
     render_data = render_resp.json()
 
-    # Validate render output structure
+    # Validate render output structure: keys exist and values are non-empty
+    # and well-typed.
     assert "token_ids" in render_data
+    assert isinstance(render_data["token_ids"], list)
+    assert len(render_data["token_ids"]) > 0
+    assert all(isinstance(t, int) for t in render_data["token_ids"])
+
     assert "features" in render_data
-    assert render_data["features"] is not None
-    assert "kwargs_data" in render_data["features"]
+    features = render_data["features"]
+    assert features is not None
+    assert isinstance(features, dict)
+
+    assert "mm_hashes" in features
+    assert "image" in features["mm_hashes"]
+    image_hashes = features["mm_hashes"]["image"]
+    assert isinstance(image_hashes, list)
+    assert len(image_hashes) > 0
+    assert all(isinstance(h, str) and h for h in image_hashes)
+
+    assert "mm_placeholders" in features
+    assert "image" in features["mm_placeholders"]
+    image_placeholders = features["mm_placeholders"]["image"]
+    assert isinstance(image_placeholders, list)
+    assert len(image_placeholders) > 0
+    for p in image_placeholders:
+        assert isinstance(p.get("offset"), int)
+        assert isinstance(p.get("length"), int)
+        assert p["length"] > 0
+
+    assert "kwargs_data" in features
+    assert "image" in features["kwargs_data"]
+    assert len(features["kwargs_data"]["image"]) > 0
 
     # Build generate request from render output
     generate_payload = render_data
@@ -220,12 +135,24 @@ async def test_render_to_generate_roundtrip(client, processor, test_image):
     gen_data = gen_resp.json()
 
     assert "choices" in gen_data
+    assert isinstance(gen_data["choices"], list)
     assert len(gen_data["choices"]) >= 1
-    assert len(gen_data["choices"][0]["token_ids"]) > 0
+    choice = gen_data["choices"][0]
+    assert "token_ids" in choice
+    assert isinstance(choice["token_ids"], list)
+    assert len(choice["token_ids"]) > 0
+    assert all(isinstance(t, int) for t in choice["token_ids"])
 
-    text = processor.tokenizer.decode(
-        gen_data["choices"][0]["token_ids"], skip_special_tokens=True
+    detok_resp = await client.post(
+        DETOKENIZE_ENDPOINT,
+        json={"model": MODEL_NAME, "tokens": choice["token_ids"]},
     )
+    detok_resp.raise_for_status()
+    detok_data = detok_resp.json()
+    assert "prompt" in detok_data
+    text = detok_data["prompt"]
+    assert isinstance(text, str)
+    assert len(text) > 0
     assert "red" in text.lower(), (
         f"Expected model to identify the red image, got: {text!r}"
     )
